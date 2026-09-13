@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+*.sif
+boltz_output_parallel/
+gpu_work/
+*.log
+.DS_Store
+Thumbs.db
