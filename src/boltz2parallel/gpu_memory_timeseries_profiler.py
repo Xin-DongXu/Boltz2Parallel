@@ -1,3 +1,5 @@
+"""Time-series VRAM profiler for Boltz runs."""
+
 #!/usr/bin/env python3
 """Boltz-2 GPU Memory Time-Series Profiler.
 

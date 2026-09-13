@@ -1,3 +1,5 @@
+"""Peak VRAM / runtime profiler for Boltz YAML inputs."""
+
 #!/usr/bin/env python3
 """Boltz GPU memory monitor.
 

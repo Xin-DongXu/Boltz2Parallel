@@ -1,3 +1,5 @@
+"""Boltz2Parallel multi-GPU executor (LPT + VRAM packing + temporal waves)."""
+
 #!/usr/bin/env python3
 """Boltz Multi-GPU Parallel Executor.
 
@@ -47,6 +49,7 @@ from dataclasses import dataclass
 import bisect
 import heapq
 import math
+import itertools
 
 # ------------------------------------------------------------
 #  Built-in Memory Profile: Boltz on A800 80GB
@@ -904,7 +907,6 @@ def _parse_yaml_core(data: Dict, yaml_path: Path) -> Optional[Dict]:
         return None
 
     protein_length = 0
-    max_protein_chain_length = 0   # length of the longest single protein chain
     rna_length = 0
     dna_length = 0
     ligand_count = 0
@@ -917,10 +919,7 @@ def _parse_yaml_core(data: Dict, yaml_path: Path) -> Optional[Dict]:
 
         if 'protein' in seq_entry:
             p = seq_entry['protein']
-            chain_len = len(p.get('sequence', ''))
-            protein_length += chain_len * count
-            if chain_len > max_protein_chain_length:
-                max_protein_chain_length = chain_len
+            protein_length += len(p.get('sequence', '')) * count
         elif 'rna' in seq_entry:
             r = seq_entry['rna']
             rna_length += len(r.get('sequence', '')) * count
@@ -943,7 +942,6 @@ def _parse_yaml_core(data: Dict, yaml_path: Path) -> Optional[Dict]:
         'name': name,
         'sequence_length': sequence_length,
         'protein_length': protein_length,
-        'max_protein_chain_length': max_protein_chain_length,
         'rna_length': rna_length,
         'dna_length': dna_length,
         'ligand_count': ligand_count,
@@ -1735,8 +1733,23 @@ def run_temporal_wave_batch(
     task_timeout: Optional[int] = 7200,
     gpu_id: int = 0,
     on_task_complete=None
-) -> List[Tuple[PredictionTask, bool, float, int]]:
-    """Execute temporal wave batch (multi-anchor)."""
+) -> Tuple[List[Tuple[PredictionTask, bool, float, int]], List[PredictionTask]]:
+    """Execute temporal wave batch (multi-anchor).
+
+    When all anchors finish before every wave is dispatched, the wave
+    tasks that were never launched are NOT silently dropped - they are
+    returned as a separate list of "deferred wave tasks" so the caller
+    can re-run them in a later parallel pass (rather than losing them).
+
+    Returns:
+        (all_results, deferred_wave_tasks)
+        - all_results: list of (task, ok, runtime, peak_mem) for tasks that
+          actually ran (anchors + completed waves).
+        - deferred_wave_tasks: PredictionTask objects from waves that were
+          skipped because all anchors finished before those waves were
+          dispatched. These have NOT been run yet and must be re-scheduled
+          by the caller.
+    """
     anchor_tasks = batch.anchor_tasks
     waves = batch.waves
     total_wt = sum(len(w.tasks) for w in waves)
@@ -1758,6 +1771,7 @@ def run_temporal_wave_batch(
     workers = needed if max_workers is None else max(needed, max_workers)
 
     all_results: List[Tuple[PredictionTask, bool, float, int]] = []
+    deferred_wave_tasks: List[PredictionTask] = []
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         anchor_futures = {
@@ -1771,11 +1785,20 @@ def run_temporal_wave_batch(
         waves_completed = 0
         waves_skipped = 0
 
-        for wave in waves:
+        for wave_idx, wave in enumerate(waves):
             if all(f.done() for f in anchor_futures):
-                waves_skipped = len(waves) - waves_completed
+                # All anchors finished before this wave was dispatched.
+                # Collect every task from waves[wave_idx:] as DEFERRED so
+                # the caller can re-run them later (instead of silently
+                # losing them, which is the original bug).
+                remaining_waves = waves[wave_idx:]
+                waves_skipped = len(remaining_waves)
+                for rw in remaining_waves:
+                    deferred_wave_tasks.extend(rw.tasks)
                 info(f"[GPU{gpu_id}] {batch.batch_id}: all anchors done early, "
-                     f"skipping {waves_skipped} remaining wave(s)")
+                     f"deferring {waves_skipped} remaining wave(s) "
+                     f"({len(deferred_wave_tasks)} task(s)) for end-of-GPU "
+                     f"parallel rerun")
                 break
 
             info(f"[GPU{gpu_id}] {batch.batch_id} {wave.wave_id}: "
@@ -1825,8 +1848,9 @@ def run_temporal_wave_batch(
     total_ok = sum(1 for _, ok, _, _ in all_results if ok)
     info(f"[GPU{gpu_id}] TemporalWave {batch.batch_id} DONE: "
          f"{total_ok}/{len(all_results)} succeeded | "
-         f"{waves_completed} waves run, {waves_skipped} skipped")
-    return all_results
+         f"{waves_completed} waves run, {waves_skipped} skipped"
+         + (f" ({len(deferred_wave_tasks)} task(s) deferred)" if deferred_wave_tasks else ""))
+    return all_results, deferred_wave_tasks
 
 
 # ------------------------------------------------------------
@@ -1838,8 +1862,28 @@ def run_gpu_worker(worker: GPUWorker, singularity_image: str,
                     strict_errors: bool, max_workers: int,
                     task_timeout: int,
                     input_dir: str = None,
-                    result_writer: StreamingResultWriter = None) -> Dict:
-    """Run all batches for a single GPU worker."""
+                    result_writer: StreamingResultWriter = None,
+                    optimizer: 'DualDimensionTaskOptimizer' = None) -> Dict:
+    """Run all batches for a single GPU worker, then a two-stage retry pass.
+
+    Stages:
+      1. Stage YAML files into the per-GPU working directory.
+      2. Walk the batch list sequentially; for each TemporalWaveBatch
+         collect any "deferred wave tasks" (tasks from waves whose
+         dispatch was skipped because all anchors finished early). For
+         every batch also collect tasks that ran but failed.
+      3. Parallel rerun pass: ONLY when at least one TemporalWaveBatch
+         deferred wave tasks. Combine deferred + (retryable) failed
+         tasks into a single rerun pool, repack via the optimizer with
+         use_temporal_waves=False (so no task can be lost again), and
+         run those rerun batches in parallel on this GPU. Anything that
+         still fails drops down to stage 4.
+      4. Final per-task retry pass (last resort): rerun each still-failed
+         task individually, one at a time, honouring the existing
+         non-retryable-error filter.
+      5. On the way out, restore staged YAML files to the original input
+         directory.
+    """
     gpu_id = worker.gpu_id
     info(f"\n{'='*60}")
     info(f"[GPU{gpu_id}] Starting with {len(worker.tasks)} tasks in {len(worker.batches)} batches")
@@ -1891,7 +1935,8 @@ def run_gpu_worker(worker: GPUWorker, singularity_image: str,
     overall_start = time.time()
     total_ok = 0
     total_fail = 0
-    failed_tasks = []
+    failed_tasks: List[Tuple[PredictionTask, float, int]] = []
+    deferred_wave_tasks: List[PredictionTask] = []
 
     for i, batch in enumerate(worker.batches, 1):
         is_temporal = isinstance(batch, TemporalWaveBatch)
@@ -1900,11 +1945,15 @@ def run_gpu_worker(worker: GPUWorker, singularity_image: str,
              f"{batch.batch_id} {batch_type_label}")
 
         if is_temporal:
-            batch_results = run_temporal_wave_batch(
+            batch_results, batch_deferred = run_temporal_wave_batch(
                 batch, singularity_image, boltz_cache_path, output_path,
                 extra_args, strict_errors, max_workers, task_timeout, gpu_id,
                 on_task_complete=on_task_complete
             )
+            if batch_deferred:
+                deferred_wave_tasks.extend(batch_deferred)
+                info(f"[GPU{gpu_id}] Batch {batch.batch_id}: deferred "
+                     f"{len(batch_deferred)} wave task(s) for parallel rerun")
         else:
             batch_results = run_batch_parallel(
                 batch, singularity_image, boltz_cache_path, output_path,
@@ -1919,27 +1968,205 @@ def run_gpu_worker(worker: GPUWorker, singularity_image: str,
                 total_fail += 1
                 failed_tasks.append((task, runtime, peak_mem))
 
-    # Retry failed tasks (sequential, solo)
-    retry_ok = 0
-    retry_skipped = 0
-    if failed_tasks:
-        # Filter out non-retryable tasks (e.g. pre_affinity FileNotFoundError)
-        retryable = []
+    # =========================================================
+    # Stage 3: Parallel rerun pass for deferred + failed tasks
+    # =========================================================
+    # Only triggered when at least one TemporalWaveBatch deferred wave
+    # tasks (i.e. its anchor finished before the wave was dispatched).
+    # In that case the deferred wave tasks would otherwise be silently
+    # lost; we combine them with retryable failed tasks, repack the
+    # union into regular FFD parallel batches via the optimizer (with
+    # use_temporal_waves=False so we cannot lose any task again), and
+    # run those batches in parallel on this GPU. Anything that still
+    # fails drops down to the per-task retry below.
+    #
+    # When NO wave tasks were deferred, behaviour is unchanged: failed
+    # tasks (if any) go straight to the per-task retry pass below.
+    rerun_recovered = 0
+    rerun_batches_run = 0
+    rerun_pool: List[PredictionTask] = []
+    rerun_pool_size = 0
+    deferred_ids: Set[str] = {t.task_id for t in deferred_wave_tasks}
+    still_failed_tasks: List[Tuple[PredictionTask, float, int]] = []
+    rerun_skipped_non_retryable = 0
+
+    if deferred_wave_tasks:
+        # Filter retryable failed tasks (preserve existing semantics:
+        # tasks whose stderr matches a non-retryable pattern stay
+        # permanently failed and never enter the rerun pool).
+        retryable_failed: List[Tuple[PredictionTask, float, int]] = []
+        permanently_failed: List[Tuple[PredictionTask, float, int]] = []
         for task, rt, pm in failed_tasks:
             last_stderr = getattr(task, '_last_stderr', '')
             if is_non_retryable_error(last_stderr):
-                retry_skipped += 1
-                warning(f"[GPU{gpu_id}] Skipping retry for {task.task_id} "
+                permanently_failed.append((task, rt, pm))
+                rerun_skipped_non_retryable += 1
+                warning(f"[GPU{gpu_id}] Skipping rerun for {task.task_id} "
                         f"(non-retryable error detected)")
             else:
-                retryable.append((task, rt, pm))
+                retryable_failed.append((task, rt, pm))
 
-        if retry_skipped:
-            info(f"[GPU{gpu_id}] {retry_skipped} task(s) marked non-retryable "
-                 f"(e.g. pre_affinity missing / import error)")
+        # Deduplicate by task_id (a task can't be both deferred AND failed
+        # in normal flow, but de-dup defensively in case logic changes).
+        seen_ids: Set[str] = set()
+        for t in deferred_wave_tasks:
+            if t.task_id not in seen_ids:
+                rerun_pool.append(t)
+                seen_ids.add(t.task_id)
+        for task, _rt, _pm in retryable_failed:
+            if task.task_id not in seen_ids:
+                rerun_pool.append(task)
+                seen_ids.add(task.task_id)
+        rerun_pool_size = len(rerun_pool)
+
+        # Pre-account: deferred tasks were never counted in total_ok or
+        # total_fail (they didn't run). Treat them as "currently failing"
+        # for the duration of the rerun stage so the running counters
+        # stay sensible; we'll decrement total_fail for each one that
+        # succeeds below. Tasks coming from `retryable_failed` are
+        # already counted in total_fail, so no extra bookkeeping.
+        total_fail += len(deferred_wave_tasks)
+
+        warning(f"[GPU{gpu_id}] Parallel rerun pool: "
+                f"{len(deferred_wave_tasks)} deferred + "
+                f"{len(retryable_failed)} retryable-failed = "
+                f"{rerun_pool_size} task(s)")
+
+    if rerun_pool:
+        # Build rerun batches via the optimizer. Disable temporal waves
+        # so no task can be deferred a second time.
+        if optimizer is not None:
+            try:
+                rerun_batches = optimizer.create_optimal_batches(
+                    rerun_pool, use_temporal_waves=False
+                )
+            except Exception as e:
+                error(f"[GPU{gpu_id}] Rerun batch packing failed: {e}; "
+                      f"falling back to one solo batch per task")
+                rerun_batches = [
+                    TaskBatch(tasks=[t], total_memory=t.estimated_memory,
+                              estimated_max_runtime=t.estimated_runtime,
+                              batch_id=f"rerun_solo_{t.task_id}")
+                    for t in rerun_pool
+                ]
+        else:
+            warning(f"[GPU{gpu_id}] No optimizer passed to run_gpu_worker; "
+                    f"running rerun pool as solo batches")
+            rerun_batches = [
+                TaskBatch(tasks=[t], total_memory=t.estimated_memory,
+                          estimated_max_runtime=t.estimated_runtime,
+                          batch_id=f"rerun_solo_{t.task_id}")
+                for t in rerun_pool
+            ]
+
+        # Tag rerun batch ids so they don't collide with original ids in TSV.
+        for rb_idx, rb in enumerate(rerun_batches, 1):
+            if not rb.batch_id.startswith('rerun_'):
+                rb.batch_id = f"rerun_{rb_idx:03d}_{rb.batch_id}"
+
+        info(f"[GPU{gpu_id}] Parallel rerun: {len(rerun_batches)} batch(es) "
+             f"across {rerun_pool_size} task(s)")
+
+        def on_rerun_task_complete(task, ok, runtime, peak_mem, gid, batch, wave_id=''):
+            # Mirror on_task_complete bookkeeping but stamp batch_type=
+            # 'rerun_parallel' and is_retry=True for tasks that previously
+            # failed, False for tasks that were merely deferred (their
+            # first actual run).
+            if batch.batch_id not in batch_trackers:
+                batch_trackers[batch.batch_id] = {
+                    'start_time': time.time(), 'peak_memory': 0, 'tasks': []
+                }
+            tracker = batch_trackers[batch.batch_id]
+            tracker['peak_memory'] = max(tracker['peak_memory'], peak_mem)
+            tracker['tasks'].append((task, ok, runtime, peak_mem))
+            batch_runtime = time.time() - tracker['start_time']
+
+            is_retry_flag = task.task_id not in deferred_ids
+            if result_writer:
+                result_writer.write_task_result(
+                    task=task, ok=ok, runtime=runtime, peak_mem=peak_mem,
+                    gpu_id=gid, batch_id=batch.batch_id,
+                    batch_peak_memory=tracker['peak_memory'],
+                    batch_runtime=batch_runtime, is_retry=is_retry_flag,
+                    batch_type='rerun_parallel', wave_id=''
+                )
+
+        for rb_idx, rb in enumerate(rerun_batches, 1):
+            info(f"[GPU{gpu_id}] Rerun batch {rb_idx}/{len(rerun_batches)}: "
+                 f"{rb.batch_id} ({len(rb.tasks)} tasks, "
+                 f"~{rb.total_memory}MB, ~{rb.estimated_max_runtime/60:.1f}min)")
+            rb_results = run_batch_parallel(
+                rb, singularity_image, boltz_cache_path, output_path,
+                extra_args, strict_errors, max_workers, task_timeout, gpu_id,
+                on_task_complete=on_rerun_task_complete
+            )
+            rerun_batches_run += 1
+            for task, ok, runtime, peak_mem in rb_results:
+                if ok:
+                    total_ok += 1
+                    total_fail -= 1
+                    rerun_recovered += 1
+                else:
+                    still_failed_tasks.append((task, runtime, peak_mem))
+
+            n_rb_ok = sum(1 for _, ok, _, _ in rb_results if ok)
+            n_rb_fail = len(rb_results) - n_rb_ok
+            info(f"[GPU{gpu_id}] Rerun batch {rb.batch_id}: "
+                 f"{n_rb_ok} ok / {n_rb_fail} failed")
+            if rb_idx < len(rerun_batches):
+                time.sleep(1)
+
+        info(f"[GPU{gpu_id}] Parallel rerun complete: "
+             f"{rerun_recovered} recovered / {len(still_failed_tasks)} still failing")
+
+    # =========================================================
+    # Stage 4: Final per-task retry pass (sequential, solo)
+    # =========================================================
+    # If we ran the parallel rerun stage, the per-task retry now operates
+    # on tasks that still failed there. Otherwise it operates on the
+    # original failed_tasks (preserving legacy behaviour).
+    retry_ok = 0
+    retry_skipped = 0
+    if deferred_wave_tasks:
+        # After Stage 3: the still-failed pool is what we retry one by one.
+        # Non-retryable tasks were filtered out before Stage 3 already.
+        final_retry_pool = still_failed_tasks
+    else:
+        final_retry_pool = failed_tasks
+
+    if final_retry_pool:
+        # Filter out non-retryable tasks (only meaningful when we did NOT
+        # already do a Stage 3 rerun, which already filtered them).
+        retryable: List[Tuple[PredictionTask, float, int]] = []
+        if not deferred_wave_tasks:
+            for task, rt, pm in final_retry_pool:
+                last_stderr = getattr(task, '_last_stderr', '')
+                if is_non_retryable_error(last_stderr):
+                    retry_skipped += 1
+                    warning(f"[GPU{gpu_id}] Skipping retry for {task.task_id} "
+                            f"(non-retryable error detected)")
+                else:
+                    retryable.append((task, rt, pm))
+            if retry_skipped:
+                info(f"[GPU{gpu_id}] {retry_skipped} task(s) marked non-retryable "
+                     f"(e.g. pre_affinity missing / import error)")
+        else:
+            # In the post-Stage-3 path, non-retryable filter was already
+            # applied; some tasks may still match non-retryable patterns
+            # if the rerun produced a fresh non-retryable stderr. Re-check
+            # to be safe.
+            for task, rt, pm in final_retry_pool:
+                last_stderr = getattr(task, '_last_stderr', '')
+                if is_non_retryable_error(last_stderr):
+                    retry_skipped += 1
+                    warning(f"[GPU{gpu_id}] Skipping retry for {task.task_id} "
+                            f"(non-retryable error detected)")
+                else:
+                    retryable.append((task, rt, pm))
 
         if retryable:
-            info(f"[GPU{gpu_id}] Retrying {len(retryable)} failed tasks (sequential)...")
+            info(f"[GPU{gpu_id}] Retrying {len(retryable)} task(s) individually "
+                 f"(sequential)...")
             for task, _, _ in retryable:
                 time.sleep(1)
                 info(f"[GPU{gpu_id}] Retrying {task.task_id}...")
@@ -1987,6 +2214,10 @@ def run_gpu_worker(worker: GPUWorker, singularity_image: str,
         'total_fail': total_fail,
         'total_time': total_time,
         'retry_ok': retry_ok,
+        'rerun_recovered': rerun_recovered,
+        'rerun_pool_size': rerun_pool_size,
+        'rerun_batches_run': rerun_batches_run,
+        'deferred_wave_tasks': len(deferred_wave_tasks),
         'worker_dir': str(worker_dir),
     }
 
@@ -2227,10 +2458,6 @@ Examples:
                           help='Skip tasks exceeding GPU VRAM instead of running them')
     io_group.add_argument('--max-seq-length', type=int, default=None, metavar='N',
                           help='Skip tasks with sequence_length > N')
-    io_group.add_argument('--max-protein-length', type=int, default=None, metavar='N',
-                          help='Skip tasks where any single protein chain in the YAML '
-                               'has sequence length > N (per-chain filter, applied independently '
-                               'of --max-seq-length)')
     io_group.add_argument('--temp-dir', type=str, default=None, metavar='DIR',
                           help='Temp working directory for GPU-specific files (default: ./gpu_work)')
 
@@ -2335,8 +2562,6 @@ Examples:
         error("--max-anchor-group-ratio must be >= 1.0"); sys.exit(1)
     if args.max_seq_length is not None and args.max_seq_length < 1:
         error("--max-seq-length must be a positive integer"); sys.exit(1)
-    if args.max_protein_length is not None and args.max_protein_length < 1:
-        error("--max-protein-length must be a positive integer"); sys.exit(1)
     if args.task_timeout is not None and args.task_timeout < 60:
         error("--task-timeout must be at least 60 seconds"); sys.exit(1)
 
@@ -2445,8 +2670,6 @@ Examples:
         info(f"Skip VRAM overflow: ENABLED")
     if args.max_seq_length is not None:
         info(f"Max seq length    : {args.max_seq_length:,}")
-    if args.max_protein_length is not None:
-        info(f"Max protein length: {args.max_protein_length:,} (per chain)")
     info(f"Singularity image : {singularity_image}")
     info(f"Boltz cache       : {boltz_cache_path}")
     info(f"GPUs used         : {selected_gpus}")
@@ -2504,13 +2727,8 @@ Examples:
 
     for i, (yaml_file, yaml_info) in enumerate(yaml_files, 1):
         seq_len = yaml_info.get('sequence_length', 0)
-        max_prot_chain = yaml_info.get('max_protein_chain_length', 0)
 
         if args.max_seq_length is not None and seq_len > args.max_seq_length:
-            token_skipped_files.append((yaml_file, yaml_info))
-            continue
-
-        if args.max_protein_length is not None and max_prot_chain > args.max_protein_length:
             token_skipped_files.append((yaml_file, yaml_info))
             continue
 
@@ -2610,7 +2828,7 @@ Examples:
                 run_gpu_worker, worker, singularity_image,
                 boltz_cache_path, output_path, extra_args,
                 args.strict_errors, args.max_workers, args.task_timeout,
-                input_dir, result_writer
+                input_dir, result_writer, optimizer
             ): worker for worker in gpu_workers
         }
 
@@ -2641,6 +2859,9 @@ Examples:
     total_ok = sum(r['total_ok'] for r in gpu_results)
     total_fail = sum(r['total_fail'] for r in gpu_results)
     total_retry_ok = sum(r.get('retry_ok', 0) for r in gpu_results)
+    total_rerun_recovered = sum(r.get('rerun_recovered', 0) for r in gpu_results)
+    total_rerun_pool = sum(r.get('rerun_pool_size', 0) for r in gpu_results)
+    total_deferred = sum(r.get('deferred_wave_tasks', 0) for r in gpu_results)
 
     print_colored("\n" + "="*80, Colors.GREEN)
     print_colored("MULTI-GPU EXECUTION COMPLETED", Colors.GREEN)
@@ -2655,8 +2876,14 @@ Examples:
     success(f"Successful (total) : {total_ok}")
     if total_fail:
         warning(f"Final failures     : {total_fail}")
+    if total_deferred:
+        info(f"Wave tasks deferred: {total_deferred} (anchor finished early)")
+    if total_rerun_pool:
+        info(f"Parallel rerun pool: {total_rerun_pool} task(s)")
+        if total_rerun_recovered:
+            info(f"  -> Recovered      : {total_rerun_recovered} (parallel rerun)")
     if total_retry_ok:
-        info(f"  -> Recovered      : {total_retry_ok}")
+        info(f"  -> Recovered      : {total_retry_ok} (per-task retry)")
     if total_ok + total_fail > 0:
         success(f"Success rate       : {total_ok/(total_ok+total_fail)*100:.1f}%")
     success(f"Results saved      : {args.output_file}")

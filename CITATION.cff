@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: If you use Boltz2Parallel, please cite it as below.
+title: "Boltz2Parallel: Profile-driven multi-GPU scheduling for Boltz"
+version: 1.0.0
+authors:
+  - family-names: Xu
+    given-names: Xin-Dong
+license: MIT
+repository-code: "https://github.com/Xin-DongXu/Boltz2Parallel"

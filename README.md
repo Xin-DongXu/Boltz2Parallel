@@ -4,103 +4,142 @@
 [![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![Boltz](https://img.shields.io/badge/Boltz-2-green.svg)](https://github.com/jwohlwend/boltz)
 
-Profile-driven multi-GPU scheduling for [Boltz](https://github.com/jwohlwend/boltz) (Boltz-1 / Boltz-2) inference — the same design principles as [AF3Parallel](https://github.com/Xin-DongXu/AF3Parallel), adapted to Boltz YAML inputs and Singularity execution.
+Profile-driven toolkit for running [Boltz](https://github.com/jwohlwend/boltz) (Boltz-1 / Boltz-2) inference at scale on multi-GPU Linux clusters.
 
-> Companion to the AF3Parallel Applications Note (BIOINF-2026-2000). This repository demonstrates that the **VRAM-profile + LPT + temporal-wave** scheduler is not AF3-specific.
-
----
-
-## What it does
-
-| Component | Role |
-| --- | --- |
-| `boltz2parallel.py` | Multi-GPU executor: length/token-aware LPT distribution, VRAM packing, temporal-wave co-scheduling |
-| `scripts/Boltz2_GPU_stat.py` | Peak VRAM / runtime profiling → TSV profile |
-| `scripts/Boltz2_GPU_memory_timeseries.py` | Sub-second VRAM time series during runs |
-| `scripts/Boltz2_YAML_Generator.py` | Build Boltz YAML inputs from sequences / complexes |
-| `scripts/Boltz2_Add_MSA_to_YAML.py` | Attach MSA fields to YAML for reuse workflows |
-| `profiles/Boltz_A800_stat_All_Len_Checked_2.tsv` | Measured A800 80 GB envelope profile (1,557 points) |
-
-Built-in default is a **linear** memory/runtime model fit on A800 (`slope_mem≈31.14 MB/token`). Pass `--legacy-step-model` for the stepwise staircase, or `--memory-profile` for a custom TSV.
+Boltz2Parallel wraps the official Boltz Singularity workflow with VRAM-aware scheduling, temporal-wave batching, and companion utilities for profiling and YAML preparation — the **same design** as [AF3Parallel](https://github.com/Xin-DongXu/AF3Parallel), adapted to Boltz YAML inputs.
 
 ---
 
-## Requirements
+## Overview
 
-- Linux + NVIDIA GPU(s), NVIDIA driver / CUDA stack compatible with your Boltz Singularity image
-- Python ≥ 3.8
-- `PyYAML` (`pip install pyyaml`)
-- A Boltz Singularity `.sif` and Boltz cache directory
+| Concept | AF3Parallel | Boltz2Parallel |
+| --- | --- | --- |
+| Inputs | AF3 JSON | Boltz YAML |
+| Runner | `run_alphafold.py` | `boltz predict` |
+| Cross-GPU | LPT by tokens | LPT by sequence length / tokens |
+| Per-GPU | VRAM packing + temporal waves | Same |
+| CLI | `af3parallel <cmd>` | `boltz2parallel <cmd>` |
+
+---
+
+## What's included
+
+| Tool | CLI command | Purpose |
+| --- | --- | --- |
+| Multi-GPU executor | `boltz2parallel run` | Distribute Boltz jobs across GPUs with LPT, packing, and temporal waves |
+| Peak VRAM profiler | `boltz2parallel profile` | One-shot peak-memory scan → TSV profile |
+| Time-series profiler | `boltz2parallel profile-ts` | Sub-second VRAM sampling during Boltz runs |
+| YAML generator | `boltz2parallel yaml generate` | Build Boltz YAML from FASTA + ligand |
+| MSA attachment | `boltz2parallel yaml add-msa` | Write MSA paths into YAML protein entries |
+
+Built-in default: measured **A800 80 GB** linear memory/runtime model (envelope fit). Other GPUs: run `boltz2parallel profile` once.
+
+---
+
+## Installation
+
+### Prerequisites
+
+Complete a Boltz installation first (Singularity `.sif`, model cache). Details: [docs/installation.md](docs/installation.md).
+
+| Component | Required | Notes |
+| --- | --- | --- |
+| Boltz + Singularity | Yes | `--sif` and `--boltz-cache` |
+| Linux + NVIDIA GPU | Yes | |
+| Python ≥ 3.8 | Yes | |
+| PyYAML | Yes | installed with the package |
+| `psutil` | Optional | via `pip install ".[extras]"` |
+
+### From source
+
+```bash
+git clone https://github.com/Xin-DongXu/Boltz2Parallel.git
+cd Boltz2Parallel
+pip install .
+```
+
+Verify:
+
+```bash
+boltz2parallel --version
+boltz2parallel --help
+```
 
 ---
 
 ## Quick start
 
 ```bash
-pip install pyyaml
+# 1. Profile once per GPU model (optional on A800 with built-in linear model)
+boltz2parallel profile \
+    -i ./yaml_input -o my_gpu_profile.tsv \
+    --sif boltz.sif --boltz-cache ~/.boltz
 
-# Optional: profile your GPU once
-python scripts/Boltz2_GPU_stat.py -h
-
-# Run the scheduler (auto-detect GPUs; temporal waves ON by default)
-python boltz2parallel.py \
-  -i ./yaml_input \
-  -o results.tsv \
-  --sif /path/to/boltz.sif \
-  --boltz-cache ~/.boltz \
-  --gpus 0,1,2,3 \
-  --gpu-preset a800-80g
-
-# Ablation: packing without temporal waves
-python boltz2parallel.py ... --no-temporal-waves
+# 2. Run across GPUs
+boltz2parallel run \
+    -i ./yaml_input -o results.tsv --output-dir ./boltz_output \
+    --sif boltz.sif --boltz-cache ~/.boltz \
+    --gpus 0,1,2,3 --gpu-preset a800-80g
 ```
 
-Extra Boltz CLI flags:
+Disable temporal waves (packing only):
 
 ```bash
-python boltz2parallel.py ... --boltz-extra-args --recycling_steps 10 --diffusion_samples 5
+boltz2parallel run ... --no-temporal-waves
 ```
+
+---
+
+## Typical workflow
+
+```
+  Boltz YAML  ──►  boltz2parallel profile  ──►  TSV profile
+       │                                           │
+       └──────────────────────────►  boltz2parallel run  ──►  results.tsv
+```
+
+See [docs/workflow.md](docs/workflow.md).
+
+---
+
+## CLI reference
+
+```bash
+boltz2parallel <command> [arguments]
+boltz2parallel run --help
+python -m boltz2parallel --help
+```
+
+| Subcommand | Standalone alias |
+| --- | --- |
+| `run` | `boltz2parallel-run` |
+| `profile` | `boltz2parallel-profile` |
+| `profile-ts` | `boltz2parallel-profile-ts` |
+| `yaml generate` | `boltz2parallel-yaml-generate` |
+| `yaml add-msa` | `boltz2parallel-yaml-add-msa` |
+
+Full guides: [docs/](docs/README.md)
+
+---
+
+## Features
+
+- Token/length-balanced **LPT** multi-GPU distribution
+- **VRAM-aware** batching with temporal-wave scheduling
+- Built-in **A800** linear (+ optional stepwise) profile
+- Streaming TSV logs, per-task retry, SIGINT cleanup
+- YAML generation and MSA attachment helpers
 
 ---
 
 ## Relation to AF3Parallel
 
-| Concept | AF3Parallel | Boltz2Parallel |
-| --- | --- | --- |
-| Inputs | AF3 JSON | Boltz YAML |
-| Token rule | AF3 residue + ligand heavy atoms | Sequence length (protein/NA/ligand as in YAML) |
-| Runner | `run_alphafold.py` via Singularity | `boltz predict` via Singularity |
-| Cross-GPU | LPT by tokens | LPT by tokens / length |
-| Per-GPU | VRAM packing + temporal waves | Same |
-| Profile | Stepwise AF3 A800 / 4090 | Linear (default) or stepwise Boltz A800 |
-
-AF3Parallel remains the manuscript-facing production package (PyPI `af3parallel`). Boltz2Parallel is released so reviewers and users can see the same scheduling idea on a second structure model without modifying Boltz itself.
+AF3Parallel ([PyPI](https://pypi.org/project/af3parallel/), [GitHub](https://github.com/Xin-DongXu/AF3Parallel)) is the manuscript-facing package for AlphaFold 3. Boltz2Parallel demonstrates that the same scheduler transfers to Boltz without modifying the Boltz runtime — answering the modularity question for BIOINF-2026-2000.
 
 ---
 
-## Repository layout
+## License & citation
 
-```
-Boltz2Parallel/
-  boltz2parallel.py          # main scheduler (canonical)
-  profiles/                  # measured A800 profile
-  scripts/                   # profiling + YAML helpers
-  examples/data/             # optional memory timeseries sample
-  archive/                   # prior drafts (not for production use)
-  LICENSE
-  README.md
-  requirements.txt
-  .gitignore
-```
+MIT License — see [LICENSE](LICENSE). Boltz is licensed separately by its authors.
 
----
-
-## Citation
-
-If you use this scheduler together with AF3Parallel, please cite the AF3Parallel Applications Note (manuscript ID BIOINF-2026-2000) and this repository URL.
-
----
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+See [CITATION.cff](CITATION.cff).

@@ -1,3 +1,5 @@
+"""Attach MSA paths to Boltz YAML protein entries."""
+
 #!/usr/bin/env python3
 """
 Add MSA file paths to Boltz style YAML inputs.

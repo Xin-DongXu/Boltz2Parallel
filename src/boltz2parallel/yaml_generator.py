@@ -1,3 +1,5 @@
+"""Batch YAML generator for Boltz protein–ligand inputs."""
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """Boltz-2 batch YAML generator.
