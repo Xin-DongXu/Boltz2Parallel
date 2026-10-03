@@ -1649,13 +1649,19 @@ def run_boltz_task(task: PredictionTask, singularity_image: str,
         filtered_stderr = ''
         if result.returncode != 0:
             warning(f"[GPU{gpu_id}] Task {task.task_id} exited with code {result.returncode}")
-            if result.stderr:
-                filtered_stderr = filter_harmless_warnings(result.stderr)
+            blob = "\n".join(x for x in (result.stderr, result.stdout) if x)
+            if blob:
+                filtered_stderr = filter_harmless_warnings(blob)
                 if filtered_stderr:
-                    error(f"[GPU{gpu_id}] Task {task.task_id} errors:\n{filtered_stderr[-1500:]}")
+                    error(f"[GPU{gpu_id}] Task {task.task_id} errors:\n{filtered_stderr[-2000:]}")
         task._last_stderr = filtered_stderr  # type: ignore[attr-defined]
 
         success_status = is_task_successful(output_dir, task_name, result, strict_errors)
+        if (not success_status) and result.returncode == 0:
+            blob = (result.stdout or "")[-1500:]
+            if blob.strip():
+                warning(f"[GPU{gpu_id}] Task {task.task_id} produced no Boltz output. "
+                        f"stdout tail:\n{blob}")
         status_word = "completed" if success_status else "FAILED"
         (info if success_status else warning)(
             f"[GPU{gpu_id}] {task.task_id} {status_word} in {runtime:.1f}s")
@@ -1895,16 +1901,39 @@ def run_gpu_worker(worker: GPUWorker, singularity_image: str,
 
     original_yaml_paths = {}
     moved_files = []
+    msa_copied = 0
+    src_dirs = set()
     for task in worker.tasks:
         dest = worker_dir / task.yaml_file.name
+        src_dirs.add(task.yaml_file.parent.resolve())
+        sidecars = _msa_sidecars_for_yaml(task.yaml_file)
         if task.yaml_file != dest and not dest.exists():
             original_path = str(task.yaml_file)
             shutil.move(original_path, str(dest))
             task.yaml_file = dest
             original_yaml_paths[dest] = original_path
             moved_files.append(task)
+        for src in sidecars:
+            dest_msa = worker_dir / src.name
+            if src.resolve() != dest_msa.resolve() and not dest_msa.exists():
+                shutil.copy2(src, dest_msa)
+                msa_copied += 1
+    # Copy every sibling MSA from the original input dir (hardlink staging
+    # can leave parse-time paths empty; glob is the reliable fallback).
+    for src_dir in src_dirs:
+        if src_dir.resolve() == worker_dir.resolve():
+            continue
+        for pattern in ("*.a3m", "*.csv", "*.sto", "*.a2m", "*.fasta"):
+            for src in src_dir.glob(pattern):
+                dest_msa = worker_dir / src.name
+                if not dest_msa.exists():
+                    shutil.copy2(src, dest_msa)
+                    msa_copied += 1
+    rewritten = _rewrite_msa_paths_for_container(worker_dir)
     if moved_files:
         info(f"[GPU{gpu_id}] Moved {len(moved_files)} YAML files to working directory")
+    info(f"[GPU{gpu_id}] MSA sidecars in work dir: {msa_copied} copied, "
+         f"{rewritten} YAML msa paths rewritten to /boltz_input/")
 
     batch_trackers = {}
 
@@ -2898,6 +2927,74 @@ _cleanup_state = {
     'input_dir': None,
     'gpu_workers': [],
 }
+
+
+def _msa_sidecars_for_yaml(yaml_file: Path) -> List[Path]:
+    """MSA files next to (or named by) a Boltz YAML. Must travel with the YAML
+    into gpu_*_work because Singularity only bind-mounts that directory."""
+    sidecars: List[Path] = []
+    try:
+        data = yaml.safe_load(yaml_file.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return sidecars
+    parent = yaml_file.parent
+    for item in data.get("sequences") or []:
+        if not isinstance(item, dict):
+            continue
+        prot = item.get("protein")
+        if not isinstance(prot, dict):
+            continue
+        m = prot.get("msa")
+        if not m:
+            continue
+        s = str(m).strip()
+        if s.lower() in ("", "empty", "none"):
+            continue
+        p = Path(s)
+        if not p.is_absolute():
+            p = parent / p
+        try:
+            if p.is_file():
+                sidecars.append(p.resolve())
+        except OSError:
+            continue
+    return sidecars
+
+
+def _rewrite_msa_paths_for_container(work_dir: Path) -> int:
+    """Point YAML msa fields at /boltz_input/<basename> (Singularity bind)."""
+    n = 0
+    files = list(work_dir.glob("*.yaml")) + list(work_dir.glob("*.yml"))
+    for yf in files:
+        try:
+            data = yaml.safe_load(yf.read_text(encoding="utf-8")) or {}
+        except Exception:
+            continue
+        changed = False
+        for item in data.get("sequences") or []:
+            if not isinstance(item, dict):
+                continue
+            prot = item.get("protein")
+            if not isinstance(prot, dict):
+                continue
+            m = prot.get("msa")
+            if not m:
+                continue
+            s = str(m).strip()
+            if s.lower() in ("", "empty", "none"):
+                continue
+            name = Path(s).name
+            new = f"/boltz_input/{name}"
+            if prot.get("msa") != new:
+                prot["msa"] = new
+                changed = True
+        if changed:
+            yf.write_text(
+                yaml.safe_dump(data, sort_keys=False, default_flow_style=False),
+                encoding="utf-8",
+            )
+            n += 1
+    return n
 
 
 def restore_yaml_files_from_gpu_work(gpu_work_dir: Path, input_dir: Path):
